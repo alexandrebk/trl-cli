@@ -1,0 +1,723 @@
+#!/usr/bin/env bash
+# trl — interface épurée par-dessus Trello.
+# Trello reste le backend : on change juste l'affichage pour éviter la surcharge
+# d'infos de l'interface web.
+#
+# Implémentation volontairement en bash + curl + jq : aucune dépendance liée à
+# une version de langage (contrairement à Ruby/rbenv), donc utilisable tel quel
+# depuis n'importe quel projet. Seule dépendance externe : jq.
+
+set -o pipefail
+
+API="https://api.trello.com/1"
+CARD_LIMIT=${TRL_CARD_LIMIT:-20}   # nb max de cartes affichées (les plus récentes)
+
+# --- dépendances ------------------------------------------------------------
+command -v curl >/dev/null 2>&1 || { echo "trl: curl is required." >&2; exit 1; }
+command -v jq   >/dev/null 2>&1 || { echo "trl: jq is required (brew install jq)." >&2; exit 1; }
+
+# --- répertoire réel du script (en suivant les symlinks) --------------------
+resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case $src in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR=$(resolve_script_dir)
+
+# --- couleurs (ANSI sobre, désactivées hors TTY ou si NO_COLOR) -------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""
+fi
+
+dim() { printf '%s%s%s' "$C_DIM" "$1" "$C_RESET"; }
+err() { printf '%s✗ %s%s\n' "$C_RED" "$1" "$C_RESET" >&2; }
+die() { err "$1"; exit 1; }
+ok()  { printf '%s✓ %s%s\n' "$C_GREEN" "$1" "$C_RESET"; }
+
+# Translittère les lettres accentuées vers leur lettre de base (é -> e, ç -> c…),
+# pour des noms de branche propres. Remplacements littéraux multi-octets : sûrs
+# quel que soit le locale (pas de classes [..] qui découperaient les octets UTF-8).
+deburr() {  # lit une chaîne en argument, écrit la version sans accents sur stdout
+  local x=$1
+  x=${x//à/a}; x=${x//á/a}; x=${x//â/a}; x=${x//ã/a}; x=${x//ä/a}; x=${x//å/a}; x=${x//ā/a}
+  x=${x//è/e}; x=${x//é/e}; x=${x//ê/e}; x=${x//ë/e}; x=${x//ē/e}
+  x=${x//ì/i}; x=${x//í/i}; x=${x//î/i}; x=${x//ï/i}; x=${x//ī/i}
+  x=${x//ò/o}; x=${x//ó/o}; x=${x//ô/o}; x=${x//õ/o}; x=${x//ö/o}; x=${x//ø/o}; x=${x//ō/o}
+  x=${x//ù/u}; x=${x//ú/u}; x=${x//û/u}; x=${x//ü/u}; x=${x//ū/u}
+  x=${x//ç/c}; x=${x//ć/c}; x=${x//č/c}; x=${x//ñ/n}; x=${x//ń/n}
+  x=${x//ý/y}; x=${x//ÿ/y}; x=${x//š/s}; x=${x//ž/z}; x=${x//œ/oe}; x=${x//æ/ae}; x=${x//ß/ss}
+  x=${x//À/A}; x=${x//Á/A}; x=${x//Â/A}; x=${x//Ã/A}; x=${x//Ä/A}; x=${x//Å/A}; x=${x//Ā/A}
+  x=${x//È/E}; x=${x//É/E}; x=${x//Ê/E}; x=${x//Ë/E}; x=${x//Ē/E}
+  x=${x//Ì/I}; x=${x//Í/I}; x=${x//Î/I}; x=${x//Ï/I}; x=${x//Ī/I}
+  x=${x//Ò/O}; x=${x//Ó/O}; x=${x//Ô/O}; x=${x//Õ/O}; x=${x//Ö/O}; x=${x//Ø/O}; x=${x//Ō/O}
+  x=${x//Ù/U}; x=${x//Ú/U}; x=${x//Û/U}; x=${x//Ü/U}; x=${x//Ū/U}
+  x=${x//Ç/C}; x=${x//Ñ/N}; x=${x//Ý/Y}
+  printf '%s' "$x"
+}
+
+# --- .env (chargé à côté du script ; l'environnement déjà défini prime) -----
+load_dotenv() {
+  local f="$SCRIPT_DIR/.env" line key val
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}            # trim début
+    case $line in ''|\#*) continue ;; esac
+    line=${line#export }
+    key=${line%%=*}; val=${line#*=}
+    key=${key//[[:space:]]/}
+    [ -z "$key" ] && continue
+    case $val in                                     # retire les guillemets
+      \"*\") val=${val#\"}; val=${val%\"} ;;
+      \'*\') val=${val#\'}; val=${val%\'} ;;
+    esac
+    [ -z "${!key:-}" ] && export "$key=$val"
+  done < "$f"
+}
+
+require_auth() {
+  load_dotenv
+  # Re-résout après le .env (qui peut définir TRL_CARD_LIMIT).
+  CARD_LIMIT=${TRL_CARD_LIMIT:-20}
+  [ -n "${TRELLO_API_KEY:-}" ] && [ -n "${TRELLO_TOKEN:-}" ] && return 0
+  die $'TRELLO_API_KEY and TRELLO_TOKEN must be set (environment or .env file).\n  Copy .env.example to .env and fill them in.\n  Generate them at https://trello.com/power-ups/admin'
+}
+
+# --- appel API Trello (auth + gestion d'erreurs) ----------------------------
+# Usage : api <METHOD> <path> [--data-urlencode "champ=valeur" ...]
+api() {
+  local method=$1 path=$2; shift 2
+  local out code body msg
+  # API Trello : tous les paramètres (auth incluse) passent en query via -G.
+  out=$(curl -sS -G -X "$method" \
+          --data-urlencode "key=${TRELLO_API_KEY:-}" \
+          --data-urlencode "token=${TRELLO_TOKEN:-}" \
+          "$@" \
+          -w $'\n%{http_code}' \
+          "$API/$path") || { err "Network error: could not reach Trello."; return 1; }
+  code=${out##*$'\n'}
+  body=${out%$'\n'*}
+  if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+    msg=$(printf '%s' "$body" | jq -r '.message // empty' 2>/dev/null)
+    [ -z "$msg" ] && msg=$body
+    err "Trello API error ($code): $msg"
+    return 1
+  fi
+  printf '%s' "$body"
+}
+
+# --- résolution floue : ID Trello OU match partiel insensible à la casse ----
+# pick <json-array> <token> <kind>
+#   stdout: objet choisi (JSON compact) en cas de succès
+#   retour: 0 trouvé · 2 aucun (silencieux) · 3 ambigu (candidats sur stderr)
+pick() {
+  local json=$1 token=$2 kind=$3 result
+  result=$(printf '%s' "$json" | jq -c --arg t "$token" '
+    ($t | ascii_downcase) as $tl
+    | ([ .[] | select(((.id // "")|ascii_downcase) == $tl
+                    or ((.shortLink // "")|ascii_downcase) == $tl) ]) as $exact
+    | if ($exact|length) > 0 then {found: $exact[0]}
+      else ([ .[] | select((.name|ascii_downcase) | contains($tl)) ]) as $m
+        | if   ($m|length) == 1 then {found: $m[0]}
+          elif ($m|length) == 0 then {none: true}
+          else {many: ($m | map(.name))} end
+      end')
+  if printf '%s' "$result" | jq -e 'has("found")' >/dev/null; then
+    printf '%s' "$result" | jq -c '.found'; return 0
+  elif printf '%s' "$result" | jq -e 'has("none")' >/dev/null; then
+    return 2
+  else
+    printf '%s%s%s\n' "$C_YELLOW" "Several ${kind}s match, please be more specific:" "$C_RESET" >&2
+    printf '%s' "$result" | jq -r '.many[] | "  - " + .' >&2
+    return 3
+  fi
+}
+
+# Variante des listes/cartes/items : pas de fallback, "aucun" => message + échec.
+resolve_one() {  # <json-array> <token> <kind>
+  local out rc
+  out=$(pick "$1" "$2" "$3"); rc=$?
+  case $rc in
+    0) printf '%s' "$out"; return 0 ;;
+    2) err "No $3 matches \"$2\"."; return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+my_boards() {
+  # API Trello : mes boards ouverts
+  api GET "members/me/boards" --data-urlencode "filter=open" \
+      --data-urlencode "fields=name,shortLink,shortUrl,closed"
+}
+
+# MES cartes (toutes, tous boards confondus) — un seul appel, à filtrer ensuite.
+# On préfère ça à /boards/<id>/cards qui ramènerait les milliers de cartes du board.
+fetch_my_cards_raw() {
+  api GET "members/me/cards" \
+      --data-urlencode "fields=name,idList,idBoard,due,dueComplete,shortLink,url" \
+      --data-urlencode "badges=true"
+}
+
+# Filtre sur un board + tri par date de création décroissante (l'ID Trello
+# commence par le timestamp de création, donc trier par .id = trier par date).
+# Lit le JSON brut sur stdin.
+filter_my_cards() {  # <board id>
+  jq -c --arg b "$1" '[ .[] | select(.idBoard == $b) ] | sort_by(.id) | reverse'
+}
+
+my_cards() { fetch_my_cards_raw | filter_my_cards "$1"; }  # <board id>, plus récentes d'abord
+
+resolve_board() {  # <token> -> objet board JSON
+  local tok=$1 boards b rc
+  boards=$(my_boards) || return 1
+  b=$(pick "$boards" "$tok" board); rc=$?
+  case $rc in
+    0) printf '%s' "$b"; return 0 ;;
+    3) return 1 ;;            # ambigu : candidats déjà affichés
+    2) ;;                     # absent de mes boards -> tentative directe
+  esac
+  # API Trello : accès direct par ID ou shortLink (board hors de "mes boards")
+  b=$(api GET "boards/$tok" --data-urlencode "fields=name,shortLink,shortUrl,closed" 2>/dev/null)
+  if [ -n "$b" ] && printf '%s' "$b" | jq -e '.id' >/dev/null 2>&1; then
+    printf '%s' "$b"; return 0
+  fi
+  err "No board matches \"$tok\"."
+  return 1
+}
+
+# --- découverte du board courant via .trello (remontée façon .git) ----------
+find_trello_file() {
+  local dir; dir=$(pwd)
+  while :; do
+    [ -f "$dir/.trello" ] && { printf '%s' "$dir/.trello"; return 0; }
+    [ "$dir" = "/" ] && return 1
+    dir=$(dirname "$dir")
+  done
+}
+
+board_from_file() {
+  local f line; f=$(find_trello_file) || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    case $line in
+      ''|\#*) continue ;;
+      [Bb][Oo][Aa][Rr][Dd]:*) line=${line#*:} ;;
+    esac
+    line=${line#"${line%%[![:space:]]*}"}            # trim espace après "board:"
+    printf '%s' "$line"; return 0
+  done < "$f"
+}
+
+current_board() {  # [board-arg] -> objet board JSON
+  local tok=${1:-}
+  [ -z "$tok" ] && tok=$(board_from_file)
+  if [ -z "$tok" ]; then
+    err $'No current board.\n  Pass a board as an argument, or create a .trello with "trl init <board>".'
+    return 1
+  fi
+  resolve_board "$tok"
+}
+
+# --- affichage des cartes ---------------------------------------------------
+show_cards() {  # <board JSON> <mineonly true|false>
+  local board=$1 mineonly=$2 id name lists cards out
+  id=$(printf '%s' "$board" | jq -r '.id')
+  name=$(printf '%s' "$board" | jq -r '.name')
+
+  if [ "$mineonly" = "true" ]; then
+    # listes + mes cartes en parallèle (2 appels indépendants).
+    local tmp; tmp=$(mktemp -d) || return 1
+    api GET "boards/$id/lists" --data-urlencode "fields=name" > "$tmp/lists" &
+    fetch_my_cards_raw                                        > "$tmp/raw"   &
+    wait
+    lists=$(cat "$tmp/lists"); cards=$(filter_my_cards "$id" < "$tmp/raw"); rm -rf "$tmp"
+    printf '%s' "$lists" | jq -e 'type=="array"' >/dev/null 2>&1 || { err "Network error: could not reach Trello."; return 1; }
+  else
+    # API Trello : listes + toutes les cartes du board (+ badges)
+    lists=$(api GET "boards/$id/lists" --data-urlencode "fields=name") || return 1
+    cards=$(api GET "boards/$id/cards" \
+              --data-urlencode "fields=name,idList,due,dueComplete,shortLink" \
+              --data-urlencode "badges=true") || return 1
+  fi
+
+  local total
+  total=$(printf '%s' "$cards" | jq 'length')
+
+  printf '%s\n\n' "$(dim "$name")"
+
+  # On garde les CARD_LIMIT plus récentes (par date de création = ordre des .id),
+  # puis on les regroupe par colonne dans l'ordre du board.
+  out=$(printf '%s' "$cards" | jq -r \
+    --argjson lists "$lists" --argjson n "$CARD_LIMIT" --arg today "$(date +%F)" \
+    --arg reset "$C_RESET" --arg bold "$C_BOLD" --arg d "$C_DIM" \
+    --arg red "$C_RED" --arg yellow "$C_YELLOW" --arg cyan "$C_CYAN" '
+    (sort_by(.id) | reverse | .[0:$n]) as $cards
+    | $lists[] | . as $l
+    | ($cards | map(select(.idList == $l.id))) as $cc
+    | select(($cc|length) > 0)
+    | ($cyan + $bold + $l.name + $reset),
+      ( $cc[]
+        | "  " + .name
+          + ( if (.badges.checkItems // 0) > 0
+              then "  " + $d + "☐ " + ((.badges.checkItemsChecked // 0)|tostring)
+                   + "/" + ((.badges.checkItems)|tostring) + $reset
+              else "" end )
+          + ( if .due
+              then ( if ((.due[0:10]) < $today and ((.dueComplete // false)|not))
+                     then $red else $yellow end ) as $col
+                   | "  " + $col + "📅 " + (.due[0:10]) + $reset
+              else "" end ) ),
+      ""')
+
+  if [ -z "$out" ]; then
+    if [ "$mineonly" = "true" ]; then
+      printf '%s\n' "$(dim "Aucune carte ne t'est attribuée sur ce board.")"
+    else
+      printf '%s\n' "$(dim "Aucune carte sur ce board.")"
+    fi
+  else
+    printf '%s\n' "$out"
+    [ "$total" -gt "$CARD_LIMIT" ] && printf '%s\n' "$(dim "($CARD_LIMIT plus récentes affichées sur $total)")"
+  fi
+}
+
+# --- commandes --------------------------------------------------------------
+cmd_ls()  { local b; b=$(current_board "${1:-}") || exit 1; show_cards "$b" true  || exit 1; }
+cmd_all() { local b; b=$(current_board "${1:-}") || exit 1; show_cards "$b" false || exit 1; }
+
+cmd_boards() {
+  local boards
+  boards=$(my_boards) || exit 1
+  printf '%s' "$boards" | jq -r --arg cyan "$C_CYAN" --arg reset "$C_RESET" '
+    sort_by(.name | ascii_downcase)[]
+    | $cyan + ((.shortLink + "          ")[0:10]) + $reset + " " + .name'
+}
+
+cmd_mv() {  # <carte> <liste>
+  local board id cards card cardid lists list listid
+  board=$(current_board) || exit 1
+  id=$(printf '%s' "$board" | jq -r '.id')
+  cards=$(api GET "boards/$id/cards" --data-urlencode "fields=name,idList,shortLink") || exit 1
+  card=$(resolve_one "$cards" "$1" card) || exit 1
+  cardid=$(printf '%s' "$card" | jq -r '.id')
+  lists=$(api GET "boards/$id/lists" --data-urlencode "fields=name") || exit 1
+  list=$(resolve_one "$lists" "$2" list) || exit 1
+  listid=$(printf '%s' "$list" | jq -r '.id')
+  # API Trello : déplace la carte vers une autre liste
+  api PUT "cards/$cardid" --data-urlencode "idList=$listid" >/dev/null || exit 1
+  ok "« $(printf '%s' "$card" | jq -r '.name') » déplacée vers « $(printf '%s' "$list" | jq -r '.name') »"
+}
+
+cmd_add() {  # <liste> "titre"
+  local board id lists list listid card
+  board=$(current_board) || exit 1
+  id=$(printf '%s' "$board" | jq -r '.id')
+  lists=$(api GET "boards/$id/lists" --data-urlencode "fields=name") || exit 1
+  list=$(resolve_one "$lists" "$1" list) || exit 1
+  listid=$(printf '%s' "$list" | jq -r '.id')
+  # API Trello : crée une carte dans la liste
+  card=$(api POST "cards" --data-urlencode "idList=$listid" --data-urlencode "name=$2") || exit 1
+  ok "Carte créée dans « $(printf '%s' "$list" | jq -r '.name') » : $(printf '%s' "$card" | jq -r '.name')"
+}
+
+cmd_check() {  # <carte> <item>
+  local board id cards card cardid checklists items item itemid
+  board=$(current_board) || exit 1
+  id=$(printf '%s' "$board" | jq -r '.id')
+  cards=$(api GET "boards/$id/cards" --data-urlencode "fields=name,shortLink") || exit 1
+  card=$(resolve_one "$cards" "$1" card) || exit 1
+  cardid=$(printf '%s' "$card" | jq -r '.id')
+  # API Trello : checklists de la carte (chacune avec ses items)
+  checklists=$(api GET "cards/$cardid/checklists") || exit 1
+  items=$(printf '%s' "$checklists" | jq -c '[ .[].checkItems[] | {id, name} ]')
+  [ "$(printf '%s' "$items" | jq 'length')" -eq 0 ] && die "This card has no checklist item."
+  item=$(resolve_one "$items" "$2" item) || exit 1
+  itemid=$(printf '%s' "$item" | jq -r '.id')
+  # API Trello : coche l'item de checklist
+  api PUT "cards/$cardid/checkItem/$itemid" --data-urlencode "state=complete" >/dev/null || exit 1
+  ok "Item coché : $(printf '%s' "$item" | jq -r '.name')"
+}
+
+cmd_init() {  # <board>
+  printf 'board: %s\n' "$1" > .trello
+  ok ".trello créé dans $(pwd) (board: $1)"
+}
+
+# --- mode interactif (fzf) --------------------------------------------------
+interactive_available() {
+  [ -t 0 ] && [ -t 1 ] && command -v fzf >/dev/null 2>&1
+}
+
+open_url() {
+  if   command -v open     >/dev/null 2>&1; then open "$1"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1"
+  else printf '%s\n' "$1"
+  fi
+}
+
+# Sélecteur fzf qui rend des lignes "id<TAB>libellé" et renvoie l'id choisi.
+fzf_pick_id() {  # <prompt> <header>  (lignes lues sur stdin)
+  local sel
+  sel=$(fzf --ansi --delimiter=$'\t' --with-nth='2..' --no-sort --layout=reverse \
+            --prompt="$1" --header="$2") || return 1
+  printf '%s' "${sel%%$'\t'*}"
+}
+
+pause() {  # attend une touche (pour lire avant que la liste fzf ne se redessine)
+  printf '%s' "$(dim '— une touche pour revenir à la liste —')"
+  read -rsn1 _ </dev/tty
+  echo
+}
+
+cmd_pick() {  # [board] — liste interactive de MES cartes -> menu d'actions
+  local tok board id lists cards lines cardid card total header first tmp
+  tok=${1:-}; [ -z "$tok" ] && tok=$(board_from_file)
+  if [ -z "$tok" ]; then
+    err $'No current board.\n  Pass a board as an argument, or create a .trello with "trl init <board>".'
+    exit 1
+  fi
+
+  # Les 3 appels Trello (board, listes, mes cartes) sont indépendants : on les
+  # lance EN PARALLÈLE (sinon 3 allers-retours séquentiels = la lenteur observée).
+  tmp=$(mktemp -d) || exit 1
+  resolve_board "$tok"                                       > "$tmp/board" &
+  api GET "boards/$tok/lists" --data-urlencode "fields=name" > "$tmp/lists" 2>/dev/null &
+  fetch_my_cards_raw                                         > "$tmp/raw"   &
+  wait
+  board=$(cat "$tmp/board")
+  if ! printf '%s' "$board" | jq -e '.id' >/dev/null 2>&1; then rm -rf "$tmp"; exit 1; fi
+  id=$(printf '%s' "$board" | jq -r '.id')
+  lists=$(cat "$tmp/lists")
+  # si l'appel listes via le token a échoué (token = nom), on le refait via l'id
+  printf '%s' "$lists" | jq -e 'type=="array"' >/dev/null 2>&1 \
+    || lists=$(api GET "boards/$id/lists" --data-urlencode "fields=name") || { rm -rf "$tmp"; exit 1; }
+  cards=$(filter_my_cards "$id" < "$tmp/raw")
+  rm -rf "$tmp"
+  first=1
+
+  # Boucle : la liste est le "hub". Échap dans la liste = quitter ;
+  # Échap dans un sous-menu = retour à la liste. On recharge les cartes à
+  # chaque tour (sauf le 1er, déjà préchargé) pour refléter les changements.
+  while true; do
+    if [ "$first" = 1 ]; then first=0; else cards=$(my_cards "$id") || exit 1; fi
+    total=$(printf '%s' "$cards" | jq 'length')
+    header="↑/↓ · Ctrl-J/Ctrl-K · Entrée = actions · Échap = quitter"
+    [ "$total" -gt "$CARD_LIMIT" ] && header="$header  —  $CARD_LIMIT/$total (plus récentes)"
+
+    # une ligne par carte : "id<TAB>[Colonne] titre  indicateurs". On garde les
+    # CARD_LIMIT plus récentes, puis tri par colonne (ordre du board).
+    lines=$(printf '%s' "$cards" | jq -r \
+      --argjson lists "$lists" --argjson n "$CARD_LIMIT" --arg today "$(date +%F)" \
+      --arg reset "$C_RESET" --arg d "$C_DIM" --arg red "$C_RED" \
+      --arg yellow "$C_YELLOW" --arg cyan "$C_CYAN" '
+      ($lists | map({(.id): .name}) | add) as $ln
+      | ($lists | to_entries | map({(.value.id): .key}) | add) as $order
+      | .[0:$n]                                   # les n plus récentes
+      | sort_by($order[.idList] // 9999)         # groupe par colonne, ordre du board
+      | .[]
+      | .id + "\t"
+        + $cyan + "[" + ($ln[.idList] // "?") + "]" + $reset + " " + .name
+        + ( if (.badges.checkItems // 0) > 0
+            then "  " + $d + "☐ " + ((.badges.checkItemsChecked // 0)|tostring)
+                 + "/" + ((.badges.checkItems)|tostring) + $reset else "" end )
+        + ( if .due
+            then ( if ((.due[0:10]) < $today and ((.dueComplete // false)|not))
+                   then $red else $yellow end ) as $c
+                 | "  " + $c + "📅 " + (.due[0:10]) + $reset
+            else "" end )')
+
+    if [ -z "$lines" ]; then
+      printf '%s\n' "$(dim "Aucune carte ne t'est attribuée sur ce board.")"
+      return 0
+    fi
+
+    cardid=$(printf '%s\n' "$lines" | fzf_pick_id 'carte> ' "$header") || return 0
+    card=$(printf '%s' "$cards" | jq -c --arg id "$cardid" '.[] | select(.id == $id)')
+    [ -z "$card" ] && continue
+    card_action_menu "$board" "$card"   # retour ici => on réaffiche la liste
+  done
+}
+
+card_action_menu() {  # <board JSON> <card JSON>
+  local board=$1 card=$2 name url action num
+  name=$(printf '%s' "$card" | jq -r '.name')
+  url=$(printf '%s' "$card" | jq -r '.url // ("https://trello.com/c/" + .shortLink)')
+  # [1] = [2]+[3]+[4]+[5] enchaînés ; [2]..[5] = les mêmes étapes, isolées.
+  # Échap ici (fzf != 0) => retour à la liste des cartes.
+  action=$(printf '%s\n' \
+    '[1] 🚀 Tout démarrer (branche + En cours + todo.md + daily.md)' \
+    '[2] Démarrer / checkout la branche git' \
+    '[3] Déplacer la carte vers « En cours »' \
+    '[4] Copier la description dans todo.md' \
+    '[5] Ajouter la carte à daily.md' \
+    '[6] Ouvrir dans le navigateur' \
+    '[7] Déplacer vers une autre colonne' \
+    '[8] Cocher un item de checklist' \
+    '[9] Voir les détails' \
+    '[10] ← Retour à la liste' \
+    | fzf --no-sort --layout=reverse --prompt='action> ' --header="Carte : $name") || return 0
+  case $action in
+    \[1\]*)  start_branch "$board" "$card" && exit 0; pause ;;
+    \[2\]*)  checkout_branch "$card";              pause ;;
+    \[3\]*)  move_to_in_progress "$board" "$card"; pause ;;
+    \[4\]*)  write_todo "$card";                   pause ;;
+    \[5\]*)  num=$(card_num "$card") && append_daily "$num" "$card"; pause ;;
+    \[6\]*)  open_url "$url" ;;
+    \[7\]*)  pick_move "$board" "$card"; [ $? -ne 2 ] && pause ;;
+    \[8\]*)  pick_check "$card";         [ $? -ne 2 ] && pause ;;
+    \[9\]*)  show_card_details "$card";  pause ;;
+    \[10\]*) return 0 ;;
+  esac
+}
+
+# Écrit la description (+ checklists) de la carte dans todo.md, à la racine du
+# repo git si possible (sinon le répertoire courant). Demande confirmation si
+# le fichier existe déjà, pour ne pas écraser des notes.
+write_todo() {  # <card JSON> [force]   (force = écrase sans confirmation)
+  local card=$1 force=${2:-} cardid full name url desc checklists dir todo ans
+  cardid=$(printf '%s' "$card" | jq -r '.id')
+  # API Trello : la carte complète (description) + ses checklists
+  full=$(api GET "cards/$cardid" --data-urlencode "fields=name,desc,url") || return 1
+  name=$(printf '%s' "$full" | jq -r '.name')
+  url=$(printf '%s' "$full" | jq -r '.url')
+  desc=$(printf '%s' "$full" | jq -r '.desc // ""')
+  checklists=$(api GET "cards/$cardid/checklists" | jq -r '
+    .[] | ("\n## " + .name),
+          (.checkItems[] | "- [" + (if .state == "complete" then "x" else " " end) + "] " + .name)') || return 1
+
+  dir=$(git rev-parse --show-toplevel 2>/dev/null) || dir=$(pwd)
+  todo="$dir/todo.md"
+  if [ -f "$todo" ] && [ "$force" != "force" ]; then
+    printf 'todo.md existe déjà dans %s. Écraser ? [y/N] ' "$dir"
+    read -r ans </dev/tty
+    case $ans in [yYoO]*) ;; *) err "Aborted, todo.md unchanged."; return 1 ;; esac
+  fi
+
+  {
+    printf '# %s\n\n%s\n' "$name" "$url"
+    [ -n "$desc" ] && printf '\n%s\n' "$desc"
+    [ -n "$checklists" ] && printf '%s\n' "$checklists"
+  } > "$todo"
+  ok "Description copiée dans $todo"
+}
+
+# Dérive "<numéro>-<slug>" depuis l'URL de la carte (dernier segment d'URL).
+# Échoue (avec message) si l'URL n'a pas la forme attendue <numéro>-<slug>.
+card_slug() {  # <card JSON> -> "<numéro>-<slug>" sur stdout
+  local card=$1 url base
+  url=$(printf '%s' "$card" | jq -r '.url // empty')
+  base=${url%%\?*}        # retire ?query
+  base=${base##*/}        # dernier segment d'URL : "15567-corriger-le-bug"
+  case $base in
+    [0-9]*-*) printf '%s' "$base" ;;
+    *) err "Could not derive a branch name from the card (URL: ${url:-?})."; return 1 ;;
+  esac
+}
+
+card_num() {  # <card JSON> -> numéro Trello ("15567") sur stdout
+  local base; base=$(card_slug "$1") || return 1
+  printf '%s' "${base%%-*}"
+}
+
+# Format de branche : <numéro>/<description> (description en underscores, sans accents).
+card_branch() {  # <card JSON> -> "<numéro>/<description>" sur stdout
+  local base desc; base=$(card_slug "$1") || return 1
+  desc=${base#*-}                        # "corriger-le-bug" (peut être %-encodé : %C3%A9…)
+  desc=$(printf '%b' "${desc//%/\\x}")   # décode l'URL : %C3%A9 -> é
+  desc=$(deburr "$desc")                 # accents -> lettre de base : é -> e
+  desc=${desc//-/_}                      # tirets -> underscores : "corriger_le_bug"
+  printf '%s/%s' "${base%%-*}" "$desc"
+}
+
+# Crée (ou checkout si elle existe) la branche dérivée de la carte.
+# Définit BRANCH_CREATED=force pour une branche neuve (sert à écraser todo.md
+# sans confirmation lors du « Tout démarrer »), sinon BRANCH_CREATED="".
+checkout_branch() {  # <card JSON>
+  local card=$1 branch
+  BRANCH_CREATED=""
+  git rev-parse --show-toplevel >/dev/null 2>&1 || { err "Not inside a git repository."; return 1; }
+  branch=$(card_branch "$card") || return 1
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git checkout "$branch" || return 1
+    ok "🔀 Checkout de la branche existante : $branch"
+  else
+    git checkout -b "$branch" || return 1
+    ok "✨ Branche créée : $branch"
+    BRANCH_CREATED="force"
+  fi
+}
+
+# « Tout démarrer » : enchaîne les 4 étapes individuelles du menu carte —
+# branche ([2]), colonne « En cours » ([3]), todo.md ([4]) et daily.md ([5]).
+# La branche est bloquante (on s'arrête si elle échoue) ; le reste est best-effort.
+start_branch() {  # <board JSON> <card JSON>
+  local board=$1 card=$2 num
+  checkout_branch "$card" || return 1
+  move_to_in_progress "$board" "$card" || true   # carte -> colonne « En cours »
+  write_todo "$card" "$BRANCH_CREATED" || true    # description -> todo.md
+  num=$(card_num "$card") && append_daily "$num" "$card" || true   # journal -> daily.md
+}
+
+# Déplace la carte vers la colonne « En cours » du board (si pas déjà dedans).
+move_to_in_progress() {  # <board JSON> <card JSON>
+  local board=$1 card=$2 id cardid curlist lists target tid tname
+  id=$(printf '%s' "$board" | jq -r '.id')
+  cardid=$(printf '%s' "$card" | jq -r '.id')
+  curlist=$(printf '%s' "$card" | jq -r '.idList')
+  lists=$(api GET "boards/$id/lists" --data-urlencode "fields=name") || return 1
+  # repère la colonne "en cours" (ou équivalent), première qui matche
+  target=$(printf '%s' "$lists" | jq -c '
+    [ .[] | select(.name | ascii_downcase
+        | (contains("en cours") or contains("in progress") or contains("doing") or contains("wip"))) ][0] // empty')
+  [ -z "$target" ] && { err "No \"in progress\" column found on the board; card not moved."; return 1; }
+  tid=$(printf '%s' "$target" | jq -r '.id')
+  tname=$(printf '%s' "$target" | jq -r '.name')
+  [ "$curlist" = "$tid" ] && return 0      # déjà en cours
+  # API Trello : déplace la carte vers la colonne « En cours »
+  api PUT "cards/$cardid" --data-urlencode "idList=$tid" >/dev/null || return 1
+  ok "Carte déplacée vers « $tname »"
+}
+
+# Journalise la tâche dans daily.md (racine du repo), groupé par date du jour.
+append_daily() {  # <numéro> <card JSON>
+  local num=$1 card=$2 name url dir daily today heading line
+  name=$(printf '%s' "$card" | jq -r '.name')
+  url=$(printf '%s' "$card" | jq -r '.url // empty')
+  dir=$(git rev-parse --show-toplevel 2>/dev/null) || dir=$(pwd)
+  daily="$dir/daily.md"
+  today=$(date +%F)
+  heading="## $today"
+  line="- [$num] $name — $url"
+
+  [ -f "$daily" ] || : > "$daily"          # crée le fichier si absent
+  # rubrique du jour si absente (séparée d'une ligne vide si le fichier a déjà du contenu)
+  if ! grep -qxF -- "$heading" "$daily" 2>/dev/null; then
+    { [ -s "$daily" ] && printf '\n'; printf '%s\n' "$heading"; } >> "$daily"
+  fi
+  # évite les doublons de la même tâche le même jour ('--' : $line commence par '-')
+  grep -qxF -- "$line" "$daily" 2>/dev/null || printf '%s\n' "$line" >> "$daily"
+  ok "Ajouté à daily.md"
+}
+
+pick_move() {  # <board JSON> <card JSON>
+  local board=$1 card=$2 id cardid name lists listid listname
+  id=$(printf '%s' "$board" | jq -r '.id')
+  cardid=$(printf '%s' "$card" | jq -r '.id')
+  name=$(printf '%s' "$card" | jq -r '.name')
+  lists=$(api GET "boards/$id/lists" --data-urlencode "fields=name") || return 1
+  listid=$(printf '%s' "$lists" | jq -r '.[] | .id + "\t" + .name' \
+            | fzf_pick_id 'colonne> ' "Déplacer « $name » vers…") || return 2
+  listname=$(printf '%s' "$lists" | jq -r --arg i "$listid" '.[] | select(.id==$i) | .name')
+  # API Trello : déplace la carte vers la colonne choisie
+  api PUT "cards/$cardid" --data-urlencode "idList=$listid" >/dev/null || return 1
+  ok "« $name » déplacée vers « $listname »"
+}
+
+pick_check() {  # <card JSON>
+  local card=$1 cardid checklists items itemid
+  cardid=$(printf '%s' "$card" | jq -r '.id')
+  # API Trello : checklists de la carte (avec leurs items et leur état)
+  checklists=$(api GET "cards/$cardid/checklists") || return 1
+  items=$(printf '%s' "$checklists" | jq -r '
+    .[] | .name as $cl | .checkItems[]
+    | .id + "\t" + (if .state == "complete" then "✓ " else "☐ " end) + .name + "  (" + $cl + ")"')
+  [ -z "$items" ] && { err "This card has no checklist item."; return 1; }
+  itemid=$(printf '%s\n' "$items" | fzf_pick_id 'item> ' 'Cocher / décocher quel item ?') || return 2
+  # bascule l'état selon l'état courant
+  local state newstate
+  state=$(printf '%s' "$checklists" | jq -r --arg i "$itemid" '.[].checkItems[] | select(.id==$i) | .state')
+  [ "$state" = "complete" ] && newstate="incomplete" || newstate="complete"
+  # API Trello : met à jour l'état de l'item de checklist
+  api PUT "cards/$cardid/checkItem/$itemid" --data-urlencode "state=$newstate" >/dev/null || return 1
+  ok "Item $([ "$newstate" = complete ] && echo coché || echo décoché)."
+}
+
+show_card_details() {  # <card JSON>
+  local card=$1 cardid full name due desc
+  cardid=$(printf '%s' "$card" | jq -r '.id')
+  # API Trello : la carte complète (description) + ses checklists
+  full=$(api GET "cards/$cardid" --data-urlencode "fields=name,desc,due,url") || return 1
+  name=$(printf '%s' "$full" | jq -r '.name')
+  printf '%s%s%s\n' "$C_BOLD" "$name" "$C_RESET"
+  printf '%s\n' "$(dim "$(printf '%s' "$full" | jq -r '.url')")"
+  due=$(printf '%s' "$full" | jq -r '.due // empty')
+  [ -n "$due" ] && printf '📅 %s\n' "${due:0:10}"
+  desc=$(printf '%s' "$full" | jq -r '.desc // ""')
+  [ -n "$desc" ] && { echo; printf '%s\n' "$desc"; }
+  echo
+  api GET "cards/$cardid/checklists" | jq -r \
+    --arg green "$C_GREEN" --arg dim "$C_DIM" --arg reset "$C_RESET" '
+    .[] | ("• " + .name),
+          (.checkItems[]
+           | "    " + (if .state == "complete" then $green + "[x] " + $reset
+                       else $dim + "[ ] " + $reset end) + .name)'
+}
+
+usage() {
+  cat <<EOF
+${C_BOLD}trl${C_RESET} — interface épurée par-dessus Trello
+
+${C_BOLD}Usage :${C_RESET}
+  trl                      mode interactif fzf (sinon liste statique = trl ls)
+  trl pick [board]         force le mode interactif (carte -> menu d'actions)
+  trl ls [board]           mes cartes, groupées par colonne (statique)
+  trl all [board]          toutes les cartes du board
+  trl boards               liste mes boards (identifiant court + nom)
+  trl mv <carte> <liste>   déplace une carte vers une autre colonne
+  trl add <liste> "titre"  crée une carte dans une colonne
+  trl check <carte> <item> coche un item de checklist
+  trl init <board>         crée un .trello dans le répertoire courant
+  trl help                 affiche cette aide
+
+${C_BOLD}Board courant :${C_RESET}
+  Défini par un fichier .trello (ligne « board: <nom-ou-id> »), cherché en
+  remontant l'arborescence depuis le répertoire courant (comme .git).
+  Un <board> explicite en argument prime toujours sur le .trello.
+
+${C_BOLD}Arguments flous :${C_RESET}
+  <board>, <carte>, <liste>, <item> acceptent un ID Trello OU un match partiel
+  insensible à la casse sur le nom (candidats listés si ambigu).
+
+${C_BOLD}Auth :${C_RESET}
+  Variables TRELLO_API_KEY et TRELLO_TOKEN (environnement ou fichier .env),
+  à générer sur https://trello.com/power-ups/admin
+EOF
+}
+
+# --- dispatch ---------------------------------------------------------------
+main() {
+  # Sans argument : mode interactif (fzf) si possible, sinon liste statique.
+  if [ $# -eq 0 ]; then
+    require_auth
+    if interactive_available; then cmd_pick ""; else cmd_ls ""; fi
+    return
+  fi
+
+  local cmd=$1
+  shift
+  case $cmd in
+    ls)     require_auth; cmd_ls "${1:-}" ;;
+    all)    require_auth; cmd_all "${1:-}" ;;
+    pick)   require_auth
+            interactive_available || die "Interactive mode requires fzf (brew install fzf) and a terminal."
+            cmd_pick "${1:-}" ;;
+    boards) require_auth; cmd_boards ;;
+    mv)     [ $# -ge 2 ] || die 'Usage: trl mv <card> <list>';    require_auth; cmd_mv "$1" "$2" ;;
+    add)    [ $# -ge 2 ] || die 'Usage: trl add <list> "title"';  require_auth; cmd_add "$1" "$2" ;;
+    check)  [ $# -ge 2 ] || die 'Usage: trl check <card> <item>'; require_auth; cmd_check "$1" "$2" ;;
+    init)   [ $# -ge 1 ] || die 'Usage: trl init <board>'; cmd_init "$1" ;;
+    help|-h|--help) usage ;;
+    *)      die "Unknown command: \"$cmd\". See \"trl help\"." ;;
+  esac
+}
+
+# Ne lance main que si le script est exécuté (pas s'il est sourcé, ex. tests).
+[ "${BASH_SOURCE[0]}" = "${0}" ] && main "$@"
