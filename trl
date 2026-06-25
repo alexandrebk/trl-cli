@@ -586,9 +586,10 @@ move_to_in_progress() {  # <board JSON> <card JSON>
   ok "Carte déplacée vers « $tname »"
 }
 
-# Journalise la tâche dans daily.md (racine du repo), groupé par date du jour.
+# Journalise la tâche dans daily.md (racine du repo), groupé par date du jour,
+# date la plus récente en haut du fichier.
 append_daily() {  # <numéro> <card JSON>
-  local num=$1 card=$2 name url dir daily today heading line
+  local num=$1 card=$2 name url dir daily today heading line tmp
   name=$(printf '%s' "$card" | jq -r '.name')
   url=$(printf '%s' "$card" | jq -r '.url // empty')
   dir=$(git rev-parse --show-toplevel 2>/dev/null) || dir=$(pwd)
@@ -598,12 +599,27 @@ append_daily() {  # <numéro> <card JSON>
   line="- [$num] $name — $url"
 
   [ -f "$daily" ] || : > "$daily"          # crée le fichier si absent
-  # rubrique du jour si absente (séparée d'une ligne vide si le fichier a déjà du contenu)
-  if ! grep -qxF -- "$heading" "$daily" 2>/dev/null; then
-    { [ -s "$daily" ] && printf '\n'; printf '%s\n' "$heading"; } >> "$daily"
-  fi
+
   # évite les doublons de la même tâche le même jour ('--' : $line commence par '-')
-  grep -qxF -- "$line" "$daily" 2>/dev/null || printf '%s\n' "$line" >> "$daily"
+  if grep -qxF -- "$line" "$daily" 2>/dev/null; then
+    ok "Déjà dans daily.md"
+    return
+  fi
+
+  tmp=$(mktemp)
+  if grep -qxF -- "$heading" "$daily" 2>/dev/null; then
+    # rubrique du jour déjà présente (en haut) : insère la tâche juste sous le titre
+    awk -v h="$heading" -v l="$line" '
+      $0 == h && !done { print; print l; done=1; next }
+      { print }
+    ' "$daily" > "$tmp"
+  else
+    # nouvelle rubrique du jour : tout en haut, le reste du fichier en dessous
+    { printf '%s\n%s\n' "$heading" "$line"
+      [ -s "$daily" ] && { printf '\n'; cat "$daily"; }
+    } > "$tmp"
+  fi
+  mv "$tmp" "$daily"
   ok "Ajouté à daily.md"
 }
 
