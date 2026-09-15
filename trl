@@ -378,7 +378,7 @@ pause() {  # attend une touche (pour lire avant que la liste fzf ne se redessine
 }
 
 cmd_pick() {  # [board] — liste interactive de MES cartes -> menu d'actions
-  local tok board id lists cards lines cardid card total header first tmp
+  local tok board id lists cards lines cardid card total header first tmp br
   tok=${1:-}; [ -z "$tok" ] && tok=$(board_from_file)
   if [ -z "$tok" ]; then
     err $'No current board.\n  Pass a board as an argument, or create a .trello with "trl init <board>".'
@@ -411,6 +411,7 @@ cmd_pick() {  # [board] — liste interactive de MES cartes -> menu d'actions
     total=$(printf '%s' "$cards" | jq 'length')
     header="↑/↓ · Ctrl-J/Ctrl-K · Entrée = actions · Échap = quitter"
     [ "$total" -gt "$CARD_LIMIT" ] && header="$header  —  $CARD_LIMIT/$total (plus récentes)"
+    br=$(git_branch); [ -n "$br" ] && header="⎇ $br"$'\n'"$header"
 
     # une ligne par carte : "id<TAB>[Colonne] titre  indicateurs". On garde les
     # CARD_LIMIT plus récentes, puis tri par colonne (ordre du board).
@@ -455,26 +456,30 @@ card_action_menu() {  # <board JSON> <card JSON>
   action=$(printf '%s\n' \
     '[1] 🚀 Tout démarrer (branche + En cours + todo.md + daily.md)' \
     '[2] Démarrer / checkout la branche git' \
-    '[3] Déplacer la carte vers « En cours »' \
-    '[4] Copier la description dans todo.md' \
-    '[5] Ajouter la carte à daily.md' \
-    '[6] Ouvrir dans le navigateur' \
-    '[7] Déplacer vers une autre colonne' \
-    '[8] Cocher un item de checklist' \
-    '[9] Voir les détails' \
-    '[10] ← Retour à la liste' \
+    '[3] ↩︎ Revenir sur master (git)' \
+    '[4] Déplacer la carte vers « En cours »' \
+    '[5] Déplacer la carte vers « Validation technique »' \
+    '[6] Copier la description dans todo.md' \
+    '[7] Ajouter la carte à daily.md' \
+    '[8] Ouvrir dans le navigateur' \
+    '[9] Déplacer vers une autre colonne' \
+    '[10] Cocher un item de checklist' \
+    '[11] Voir les détails' \
+    '[12] ← Retour à la liste' \
     | fzf --no-sort --layout=reverse --prompt='action> ' --header="Carte : $name") || return 0
   case $action in
     \[1\]*)  start_branch "$board" "$card" && exit 0; pause ;;
     \[2\]*)  checkout_branch "$card";              pause ;;
-    \[3\]*)  move_to_in_progress "$board" "$card"; pause ;;
-    \[4\]*)  write_todo "$card";                   pause ;;
-    \[5\]*)  num=$(card_num "$card") && append_daily "$num" "$card"; pause ;;
-    \[6\]*)  open_url "$url" ;;
-    \[7\]*)  pick_move "$board" "$card"; [ $? -ne 2 ] && pause ;;
-    \[8\]*)  pick_check "$card";         [ $? -ne 2 ] && pause ;;
-    \[9\]*)  show_card_details "$card";  pause ;;
-    \[10\]*) return 0 ;;
+    \[3\]*)  checkout_default_branch;              pause ;;
+    \[4\]*)  move_to_in_progress "$board" "$card"; pause ;;
+    \[5\]*)  move_to_validation "$board" "$card";  pause ;;
+    \[6\]*)  write_todo "$card";                   pause ;;
+    \[7\]*)  num=$(card_num "$card") && append_daily "$num" "$card"; pause ;;
+    \[8\]*)  open_url "$url" ;;
+    \[9\]*)  pick_move "$board" "$card"; [ $? -ne 2 ] && pause ;;
+    \[10\]*) pick_check "$card";         [ $? -ne 2 ] && pause ;;
+    \[11\]*) show_card_details "$card";  pause ;;
+    \[12\]*) return 0 ;;
   esac
 }
 
@@ -555,6 +560,25 @@ checkout_branch() {  # <card JSON>
   fi
 }
 
+# Nom de la branche git courante (vide hors dépôt git).
+git_branch() {
+  git rev-parse --abbrev-ref HEAD 2>/dev/null
+}
+
+# Revient sur la branche par défaut : master si elle existe, sinon main.
+checkout_default_branch() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 || { err "Not inside a git repository."; return 1; }
+  local branch
+  for branch in master main; do
+    git show-ref --verify --quiet "refs/heads/$branch" || continue
+    git checkout "$branch" || return 1
+    ok "↩︎ Retour sur $branch"
+    return 0
+  done
+  err "Aucune branche master ou main dans ce dépôt."
+  return 1
+}
+
 # « Tout démarrer » : enchaîne les 4 étapes individuelles du menu carte —
 # branche ([2]), colonne « En cours » ([3]), todo.md ([4]) et daily.md ([5]).
 # La branche est bloquante (on s'arrête si elle échoue) ; le reste est best-effort.
@@ -566,24 +590,33 @@ start_branch() {  # <board JSON> <card JSON>
   num=$(card_num "$card") && append_daily "$num" "$card" || true   # journal -> daily.md
 }
 
-# Déplace la carte vers la colonne « En cours » du board (si pas déjà dedans).
-move_to_in_progress() {  # <board JSON> <card JSON>
-  local board=$1 card=$2 id cardid curlist lists target tid tname
+# Déplace la carte vers la première colonne dont le nom matche <regex>
+# (comparaison en minuscules). <desc> ne sert qu'au message d'erreur.
+move_card_to() {  # <board JSON> <card JSON> <desc> <regex>
+  local board=$1 card=$2 desc=$3 regex=$4 id cardid curlist lists target tid tname
   id=$(printf '%s' "$board" | jq -r '.id')
   cardid=$(printf '%s' "$card" | jq -r '.id')
   curlist=$(printf '%s' "$card" | jq -r '.idList')
   lists=$(api GET "boards/$id/lists" --data-urlencode "fields=name") || return 1
-  # repère la colonne "en cours" (ou équivalent), première qui matche
-  target=$(printf '%s' "$lists" | jq -c '
-    [ .[] | select(.name | ascii_downcase
-        | (contains("en cours") or contains("in progress") or contains("doing") or contains("wip"))) ][0] // empty')
-  [ -z "$target" ] && { err "No \"in progress\" column found on the board; card not moved."; return 1; }
+  target=$(printf '%s' "$lists" | jq -c --arg re "$regex" '
+    [ .[] | select(.name | ascii_downcase | test($re)) ][0] // empty')
+  [ -z "$target" ] && { err "No \"$desc\" column found on the board; card not moved."; return 1; }
   tid=$(printf '%s' "$target" | jq -r '.id')
   tname=$(printf '%s' "$target" | jq -r '.name')
-  [ "$curlist" = "$tid" ] && return 0      # déjà en cours
-  # API Trello : déplace la carte vers la colonne « En cours »
+  [ "$curlist" = "$tid" ] && return 0
+  # API Trello : déplace la carte vers la colonne cible
   api PUT "cards/$cardid" --data-urlencode "idList=$tid" >/dev/null || return 1
   ok "Carte déplacée vers « $tname »"
+}
+
+# Déplace la carte vers la colonne « En cours » du board (si pas déjà dedans).
+move_to_in_progress() {  # <board JSON> <card JSON>
+  move_card_to "$1" "$2" "in progress" "en cours|in progress|doing|wip"
+}
+
+# Déplace la carte vers la colonne « Validation technique » du board.
+move_to_validation() {  # <board JSON> <card JSON>
+  move_card_to "$1" "$2" "validation technique" "validation technique|validation tech|valid.*tech"
 }
 
 # Journalise la tâche dans daily.md (racine du repo), groupé par date du jour,

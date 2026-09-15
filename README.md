@@ -80,7 +80,8 @@ trl help                 affiche l'aide
 ### Mode interactif (fzf)
 
 Lancé sans argument dans un terminal, `trl` ouvre la liste de **mes cartes**
-dans `fzf` (si installé). Tu navigues, tu filtres en tapant, puis :
+dans `fzf` (si installé). L'en-tête affiche la **branche git courante** (`⎇ …`)
+quand tu es dans un dépôt. Tu navigues, tu filtres en tapant, puis :
 
 - **↑/↓** ou **Ctrl-J / Ctrl-K** : se déplacer
 - **Entrée** : ouvrir le menu d'actions sur la carte :
@@ -93,6 +94,10 @@ dans `fzf` (si installé). Tu navigues, tu filtres en tapant, puis :
        demander sur une branche **neuve**, demande confirmation sinon ;
     4. ajoute la tâche à `daily.md` (racine du repo, groupé par date) ;
     5. puis quitte `trl` pour te laisser coder.
+  - **Revenir sur master** (git) — `checkout` de la branche par défaut du dépôt
+    (`master`, ou `main` à défaut)
+  - **Déplacer vers « En cours »** / **vers « Validation technique »** —
+    déplace la carte vers la colonne correspondante (détectée par son nom)
   - **Copier la description dans todo.md** — écrit la description + les
     checklists (en cases `- [ ]`) dans `todo.md`, avec confirmation si le
     fichier existe déjà
