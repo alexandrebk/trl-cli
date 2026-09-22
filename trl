@@ -62,6 +62,15 @@ deburr() {  # lit une chaîne en argument, écrit la version sans accents sur st
   printf '%s' "$x"
 }
 
+# Nettoie un texte libre en segment de branche : accents retirés, minuscules,
+# espaces/tirets -> underscores, tout caractère hors [a-z0-9_] supprimé.
+branch_part() {  # <texte> -> segment sûr sur stdout
+  local s; s=$(deburr "$1")
+  s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+  s=${s// /_}; s=${s//-/_}
+  printf '%s' "$s" | tr -cd 'a-z0-9_'
+}
+
 # --- .env (chargé à côté du script ; l'environnement déjà défini prime) -----
 load_dotenv() {
   local f="$SCRIPT_DIR/.env" line key val
@@ -533,13 +542,15 @@ card_num() {  # <card JSON> -> numéro Trello ("15567") sur stdout
   printf '%s' "${base%%-*}"
 }
 
-# Format de branche : <numéro>/<description> (description en underscores, sans accents).
-card_branch() {  # <card JSON> -> "<numéro>/<description>" sur stdout
-  local base desc; base=$(card_slug "$1") || return 1
+# Format de branche : <numéro>/<feature>/<description> si une feature est fournie,
+# sinon <numéro>/<description>. Feature et description en underscores, sans accents.
+card_branch() {  # <card JSON> [feature] -> nom de branche sur stdout
+  local base desc feature=${2:-}; base=$(card_slug "$1") || return 1
   desc=${base#*-}                        # "corriger-le-bug" (peut être %-encodé : %C3%A9…)
   desc=$(printf '%b' "${desc//%/\\x}")   # décode l'URL : %C3%A9 -> é
   desc=$(deburr "$desc")                 # accents -> lettre de base : é -> e
   desc=${desc//-/_}                      # tirets -> underscores : "corriger_le_bug"
+  [ -n "$feature" ] && { printf '%s/%s/%s' "${base%%-*}" "$feature" "$desc"; return; }
   printf '%s/%s' "${base%%-*}" "$desc"
 }
 
@@ -547,10 +558,13 @@ card_branch() {  # <card JSON> -> "<numéro>/<description>" sur stdout
 # Définit BRANCH_CREATED=force pour une branche neuve (sert à écraser todo.md
 # sans confirmation lors du « Tout démarrer »), sinon BRANCH_CREATED="".
 checkout_branch() {  # <card JSON>
-  local card=$1 branch
+  local card=$1 branch feature
   BRANCH_CREATED=""
   git rev-parse --show-toplevel >/dev/null 2>&1 || { err "Not inside a git repository."; return 1; }
-  branch=$(card_branch "$card") || return 1
+  printf 'Nom de la feature (vide = branche à la racine) : '
+  read -r feature </dev/tty
+  feature=$(branch_part "$feature")
+  branch=$(card_branch "$card" "$feature") || return 1
   if git show-ref --verify --quiet "refs/heads/$branch"; then
     git checkout "$branch" || return 1
     ok "🔀 Checkout de la branche existante : $branch"
