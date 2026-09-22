@@ -161,7 +161,7 @@ my_boards() {
 # On préfère ça à /boards/<id>/cards qui ramènerait les milliers de cartes du board.
 fetch_my_cards_raw() {
   api GET "members/me/cards" \
-      --data-urlencode "fields=name,idList,idBoard,due,dueComplete,shortLink,url" \
+      --data-urlencode "fields=name,idList,idBoard,idShort,due,dueComplete,shortLink,url" \
       --data-urlencode "badges=true"
 }
 
@@ -244,7 +244,7 @@ show_cards() {  # <board JSON> <mineonly true|false>
     # API Trello : listes + toutes les cartes du board (+ badges)
     lists=$(api GET "boards/$id/lists" --data-urlencode "fields=name") || return 1
     cards=$(api GET "boards/$id/cards" \
-              --data-urlencode "fields=name,idList,due,dueComplete,shortLink" \
+              --data-urlencode "fields=name,idList,idShort,due,dueComplete,shortLink" \
               --data-urlencode "badges=true") || return 1
   fi
 
@@ -265,7 +265,7 @@ show_cards() {  # <board JSON> <mineonly true|false>
     | select(($cc|length) > 0)
     | ($cyan + $bold + $l.name + $reset),
       ( $cc[]
-        | "  " + .name
+        | "  " + $d + "#" + (.idShort|tostring) + $reset + " " + .name
           + ( if (.badges.checkItems // 0) > 0
               then "  " + $d + "☐ " + ((.badges.checkItemsChecked // 0)|tostring)
                    + "/" + ((.badges.checkItems)|tostring) + $reset
@@ -425,7 +425,8 @@ cmd_pick() {  # [board] — liste interactive de MES cartes -> menu d'actions
       | sort_by($order[.idList] // 9999)         # groupe par colonne, ordre du board
       | .[]
       | .id + "\t"
-        + $cyan + "[" + ($ln[.idList] // "?") + "]" + $reset + " " + .name
+        + $cyan + "[" + ($ln[.idList] // "?") + "]" + $reset
+        + " " + $d + "#" + (.idShort|tostring) + $reset + " " + .name
         + ( if (.badges.checkItems // 0) > 0
             then "  " + $d + "☐ " + ((.badges.checkItemsChecked // 0)|tostring)
                  + "/" + ((.badges.checkItems)|tostring) + $reset else "" end )
