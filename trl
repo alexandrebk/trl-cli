@@ -603,6 +603,19 @@ start_branch() {  # <board JSON> <card JSON>
   move_to_in_progress "$board" "$card" || true   # carte -> colonne « En cours »
   write_todo "$card" "$BRANCH_CREATED" || true    # description -> todo.md
   num=$(card_num "$card") && append_daily "$num" "$card" || true   # journal -> daily.md
+  launch_claude_todo   # propose de lancer Claude Code sur le todo (exec si oui)
+}
+
+# Propose de lancer Claude Code sur le todo fraîchement écrit. Si l'utilisateur
+# accepte, remplace le process trl par « ccc start -- /todo » (exec, pas de retour).
+launch_claude_todo() {
+  local ans
+  command -v ccc >/dev/null 2>&1 || { err "ccc introuvable, Claude non lancé."; return 0; }
+  printf 'Lancer Claude Code sur le todo (ccc start -- /todo) ? [y/N] '
+  read -r ans </dev/tty
+  case $ans in [yYoO]*) ;; *) return 0 ;; esac
+  ok "🚀 Lancement de Claude Code…"
+  exec ccc start -- /todo
 }
 
 # Déplace la carte vers la première colonne dont le nom matche <regex>
