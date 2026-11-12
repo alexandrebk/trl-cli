@@ -355,6 +355,12 @@ cmd_check() {  # <carte> <item>
   ok "Item coché : $(printf '%s' "$item" | jq -r '.name')"
 }
 
+cmd_open() {
+  local board
+  board=$(current_board "${1:-}") || exit 1
+  open_url "$(printf '%s' "$board" | jq -r '.shortUrl // ("https://trello.com/b/" + .shortLink)')"
+}
+
 cmd_init() {  # <board>
   printf 'board: %s\n' "$1" > .trello
   ok ".trello créé dans $(pwd) (board: $1)"
@@ -748,6 +754,7 @@ ${C_BOLD}Usage :${C_RESET}
   trl ls [board]           mes cartes, groupées par colonne (statique)
   trl all [board]          toutes les cartes du board
   trl boards               liste mes boards (identifiant court + nom)
+  trl open [board]         ouvre le board dans le navigateur
   trl mv <carte> <liste>   déplace une carte vers une autre colonne
   trl add <liste> "titre"  crée une carte dans une colonne
   trl check <carte> <item> coche un item de checklist
@@ -787,6 +794,7 @@ main() {
             interactive_available || die "Interactive mode requires fzf (brew install fzf) and a terminal."
             cmd_pick "${1:-}" ;;
     boards) require_auth; cmd_boards ;;
+    open)   require_auth; cmd_open "${1:-}" ;;
     mv)     [ $# -ge 2 ] || die 'Usage: trl mv <card> <list>';    require_auth; cmd_mv "$1" "$2" ;;
     add)    [ $# -ge 2 ] || die 'Usage: trl add <list> "title"';  require_auth; cmd_add "$1" "$2" ;;
     check)  [ $# -ge 2 ] || die 'Usage: trl check <card> <item>'; require_auth; cmd_check "$1" "$2" ;;

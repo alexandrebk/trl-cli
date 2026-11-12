@@ -70,6 +70,7 @@ trl pick [board]         force le mode interactif (carte -> menu d'actions)
 trl ls [board]           mes cartes, groupées par colonne (statique)
 trl all [board]          toutes les cartes du board
 trl boards               mes boards (identifiant court réutilisable + nom)
+trl open [board]         ouvre le board dans le navigateur
 trl mv <carte> <liste>   déplace une carte vers une autre colonne
 trl add <liste> "titre"  crée une carte dans une colonne
 trl check <carte> <item> coche un item de checklist
